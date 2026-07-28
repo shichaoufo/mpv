@@ -1,0 +1,88 @@
+name: build-libmpv-d3d11
+
+on:
+  push:
+    branches:
+      - ci
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  mingw-libmpv:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      DOWNLOAD_CACHE: ${{ github.workspace }}/.ccache/downloads
+      TARGET: x86_64-w64-mingw32
+      RUST_TARGET: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get time
+        id: get_time
+        run: echo "timestamp=`date +%s%N`" >> $GITHUB_OUTPUT
+
+      - name: Restore cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-${{ steps.get_time.outputs.timestamp }}
+          restore-keys: ${{ env.TARGET }}-
+
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ccache g++-mingw-w64 gcc-multilib python3-pip nasm ninja-build pkgconf wine64
+          python -m pip install meson
+
+      - name: Install Meson Wraps
+        run: |
+          mkdir subprojects -p
+          meson wrap install mujs
+          meson subprojects download
+
+      - name: Build libraries
+        run: |
+          ./ci/build-mingw64.sh
+
+      - name: Build mpv with meson
+        id: build
+        run: |
+          ./ci/build-mingw64.sh meson pack
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: |
+          cat ./mingw_build/meson-logs/meson-log.txt
+
+      - name: Package libmpv dev files
+        run: |
+          mkdir -p artifact/mpv-dev/include/mpv
+          cp -v include/mpv/client.h include/mpv/render.h include/mpv/render_d3d11.h artifact/mpv-dev/include/mpv/
+          cp -v mingw_build/libmpv-2.dll artifact/mpv-dev/
+          cp -v mingw_build/libmpv.dll.a artifact/mpv-dev/
+
+      - name: Artifact name
+        id: artifact
+        run: |
+          VERSION_FILE=$(find . -path "*/common/version.h" -type f | head -n 1)
+          VER=$(grep VERSION "$VERSION_FILE" | cut -d'"' -f2)
+          echo "name=mpv-libmpv-d3d11-$VER-${{ github.run_id }}-$TARGET" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: artifact/*
+
+      - name: Save Cache
+        uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-${{ steps.get_time.outputs.timestamp }}
