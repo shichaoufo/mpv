@@ -1,0 +1,179 @@
+name: build libmpv D3D11 (x86_64-v3)
+on:
+  workflow_dispatch:
+    inputs:
+      apply_pr:
+        description: "Apply PR#17764 (D3D11 render API)"
+        required: false
+        default: "true"
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  mingw-libmpv-v3:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      DOWNLOAD_CACHE: ${{ github.workspace }}/.ccache/downloads
+      TARGET: x86_64-w64-mingw32
+      RUST_TARGET: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get time
+        id: get_time
+        run: echo "timestamp=`date +%s%N`" >> $GITHUB_OUTPUT
+
+      - name: Restore cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-v3-${{ steps.get_time.outputs.timestamp }}
+          restore-keys: |
+            ${{ env.TARGET }}-v3-
+            ${{ env.TARGET }}-
+
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ccache g++-mingw-w64 gcc-multilib python3-pip nasm ninja-build pkgconf wine64
+          python -m pip install meson
+
+      - name: Install Meson Wraps
+        run: |
+          mkdir subprojects -p
+          meson wrap install mujs
+          meson subprojects download
+
+      - name: Download and apply PR#17764 patch
+        if: inputs.apply_pr == 'true'
+        run: |
+          curl -L "https://patch-diff.githubusercontent.com/raw/mpv-player/mpv/pull/17764.patch" -o /tmp/pr17764.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am --3way /tmp/pr17764.patch || {
+            echo "git am failed, trying git apply --3way"
+            git apply --3way /tmp/pr17764.patch || {
+              echo "git apply --3way failed, trying plain git apply"
+              git apply /tmp/pr17764.patch || {
+                echo "Failed to apply patch"
+                exit 1
+              }
+            }
+          }
+          echo "PR#17764 patch applied successfully"
+
+      - name: Build libraries (generate crossfile + build all deps)
+        run: |
+          ./ci/build-mingw64.sh
+
+      - name: Build mpv/libmpv with meson (x86_64-v3 optimizations)
+        id: build
+        run: |
+          prefix_dir=$PWD/mingw_prefix
+
+          # Verify compiler supports x86-64-v3
+          $TARGET-gcc-posix -march=x86-64-v3 -E - < /dev/null > /dev/null 2>&1 && \
+            echo "Compiler supports x86-64-v3" || \
+            echo "Warning: Compiler may not fully support x86-64-v3"
+
+          # Setup environment flags for header/library search paths
+          export CFLAGS="-I'$prefix_dir/include'"
+          export LDFLAGS="-L'$prefix_dir/lib'"
+
+          build=mingw_build
+          rm -rf $build
+
+          # Replicate build-mingw64.sh mpv_args + inject x86_64-v3 flags.
+          # Command-line -D{c,cpp}_{args,link_args} override crossfile values.
+          meson setup $build \
+            --cross-file "$prefix_dir/crossfile" \
+            --werror \
+            -Dlibmpv=true \
+            -Dtests=true \
+            --buildtype debugoptimized \
+            --force-fallback-for=mujs \
+            -Dmujs:werror=false \
+            -Dmujs:default_library=static \
+            -Dlua=luajit \
+            -Damf=enabled \
+            -Dshaderc=enabled \
+            -Dspirv-cross=enabled \
+            -Dd3d11=enabled \
+            -Djavascript=enabled \
+            -Dlibcurl=enabled \
+            -Dc_args="-march=x86-64-v3 -mtune=haswell -O2 -pipe -Wall -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3" \
+            -Dcpp_args="-march=x86-64-v3 -mtune=haswell -O2 -pipe -Wall -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3" \
+            -Dc_link_args="-march=x86-64-v3 -fstack-protector-strong" \
+            -Dcpp_link_args="-march=x86-64-v3 -fstack-protector-strong"
+
+          meson compile -C $build
+
+          # Pack mpv.exe + runtime DLLs (replicate build-mingw64.sh "pack")
+          mkdir -p artifact/tmp
+          cp -pv $build/mpv.com $build/mpv.exe etc/mpv-*.bat artifact/ 2>/dev/null || true
+          cp -p "$prefix_dir/bin/"*.dll artifact/tmp/ 2>/dev/null || true
+          shopt -s nullglob
+          for file in /usr/lib/gcc/$TARGET/*-posix/*.dll /usr/$TARGET/lib/*.dll; do
+              cp -p "$file" artifact/tmp/
+          done
+          pushd artifact/tmp
+          dlls=(
+              libgcc_*.dll lib{ssp,stdc++,winpthread}-[0-9]*.dll
+              av*.dll sw*.dll postproc-[0-9]*.dll
+              subrandr-[0-9]*.dll lib{ass,freetype,fribidi,harfbuzz,iconv,placebo}-[0-9]*.dll
+              lib{curl,shaderc_shared,spirv-cross-c-shared,dav1d,lcms2,zlib1}.dll
+          )
+          [[ -f vulkan-1.dll ]] && dlls+=(vulkan-1.dll)
+          for f in "${dlls[@]}"; do
+              [[ -f "$f" ]] && mv -v "$f" ..
+          done
+          popd
+          rm -rf artifact/tmp
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: |
+          cat ./mingw_build/meson-logs/meson-log.txt
+
+      - name: Package libmpv dev files
+        run: |
+          mkdir -p artifact/mpv-dev/include/mpv
+          cp -v include/mpv/client.h include/mpv/render.h artifact/mpv-dev/include/mpv/
+          # render_d3d11.h comes from PR#17764, might be in-tree or generated
+          if [[ -f include/mpv/render_d3d11.h ]]; then
+            cp -v include/mpv/render_d3d11.h artifact/mpv-dev/include/mpv/
+          else
+            # Check mingw_build for generated headers too
+            find mingw_build -name "render_d3d11.h" -exec cp -v {} artifact/mpv-dev/include/mpv/ \; 2>/dev/null || true
+          fi
+          cp -v mingw_build/libmpv-2.dll artifact/mpv-dev/ 2>/dev/null || \
+            find mingw_build -maxdepth 2 -name "libmpv*.dll" -exec cp -v {} artifact/mpv-dev/ \;
+          cp -v mingw_build/libmpv.dll.a artifact/mpv-dev/ 2>/dev/null || \
+            find mingw_build -maxdepth 2 -name "libmpv*.dll.a" -exec cp -v {} artifact/mpv-dev/ \;
+
+      - name: Artifact name
+        id: artifact
+        run: |
+          VERSION_FILE=$(find . -path "*/common/version.h" -type f | head -n 1)
+          VER=$(grep VERSION "$VERSION_FILE" | cut -d'"' -f2)
+          echo "name=mpv-libmpv-d3d11-x86_64-v3-$VER-${{ github.run_id }}-$TARGET" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: artifact/*
+
+      - name: Save Cache
+        uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-v3-${{ steps.get_time.outputs.timestamp }}
