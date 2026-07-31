@@ -1,0 +1,202 @@
+name: build libmpv D3D11 (x86_64-v3)
+on:
+  workflow_dispatch:
+    inputs:
+      apply_pr:
+        description: "Apply PR#17764 (D3D11 render API)"
+        required: false
+        default: "true"
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  mingw:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      DOWNLOAD_CACHE: ${{ github.workspace }}/.ccache/downloads
+      TARGET: x86_64-w64-mingw32
+      RUST_TARGET: x86_64-pc-windows-gnu
+      # x86_64-v3 specific flags
+      CFLAGS: "-march=x86-64-v3 -mtune=haswell"
+      CXXFLAGS: "-march=x86-64-v3 -mtune=haswell"
+      LDFLAGS: "-march=x86-64-v3"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      
+      - name: Get time
+        id: get_time
+        run: echo "timestamp=`date +%s%N`" >> $GITHUB_OUTPUT
+      
+      - name: Restore cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-v3-${{ steps.get_time.outputs.timestamp }}
+          restore-keys: ${{ env.TARGET }}-v3-
+      
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ccache g++-mingw-w64 gcc-multilib python3-pip nasm ninja-build pkgconf wine64
+          python -m pip install meson
+      
+      - name: Install Meson Wraps
+        run: |
+          mkdir subproj
+          # Download wraps from mpv's meson wrap system
+          for wrap in ffmpeg luajit shaderc spirv-cross; do
+            curl -L "https://raw.githubusercontent.com/mpv-player/mpv/master/subprojects/${wrap}.wrap" -o "${wrap}.wrap" 2>/dev/null || true
+          done
+        
+      - name: Download and apply PR#17764 patch
+        if: inputs.apply_pr == 'true'
+        run: |
+          curl -L "https://patch-diff.githubusercontent.com/raw/mpv-player/mpv/pull/17764.patch" -o /tmp/pr17764.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am --3way /tmp/pr17764.patch || {
+            echo "Patch failed to apply, trying with git apply"
+            git apply --3way /tmp/pr17764.patch || {
+              echo "Failed to apply patch"
+              exit 1
+            }
+          }
+          echo "PR#17764 patch applied successfully"
+      
+      - name: Setup MinGW environment for x86_64-v3
+        run: |
+          # Configure MinGW to use x86_64-v3 optimizations
+          sudo update-alternatives --set ${{ env.TARGET }}-gcc /usr/bin/${{ env.TARGET }}-gcc-posix || true
+          sudo update-alternatives --set ${{ env.TARGET }}-g++ /usr/bin/${{ env.TARGET }}-g++-posix || true
+          
+          # Verify compiler supports x86-64-v3
+          ${{ env.TARGET }}-gcc -march=x86-64-v3 -E - < /dev/null > /dev/null 2>&1 && \
+            echo "Compiler supports x86-64-v3" || \
+            echo "Warning: Compiler may not fully support x86-64-v3"
+      
+      - name: Configure
+        run: |
+          # Create build directory
+          mkdir -p build && cd build
+          
+          # Configure with Meson for MinGW cross-compilation
+          meson setup .. \
+            --cross-file ../cross-files/${{ env.TARGET }}.txt \
+            --buildtype release \
+            --default-library static \
+            -Dlibmpv=true \
+            -Dpdf-build=disabled \
+            -Dbuild-date=false \
+            -Dmanpage-build=disabled \
+            -Dc_args="-march=x86-64-v3 -mtune=haswell -O2" \
+            -Dcpp_args="-march=x86-64-v3 -mtune=haswell -O2" \
+            -Dc_link_args="-march=x86-64-v3" \
+            -Dcpp_link_args="-march=x86-64-v3"
+        
+      - name: Build
+        run: |
+          cd build
+          meson compile
+      
+      - name: Package libmpv
+        run: |
+          cd build
+          
+          # Create artifact directory
+          mkdir -p ../artifact/libmpv-d3d11-x86_64-v3
+          
+          # Copy headers
+          cp -r mpv/include/mpv ../artifact/libmpv-d3d11-x86_64-v3/ 2>/dev/null || true
+          
+          # Copy import library
+          find . -name "*.dll.a" -o -name "libmpv*.a" | head -10 | while read f; do
+            cp "$f" ../artifact/libmpv-d3d11-x86_64-v3/
+          done
+          
+          # Copy DLLs (runtime)
+          find . -name "*.dll" | head -20 | while read f; do
+            cp "$f" ../artifact/libmpv-d3d11-x86_64-v3/
+          done
+          
+          # Package as 7z
+          cd ../artifact
+          7z a -t7z -mx=9 ../libmpv-d3d11-x86_64-v3.7z libmpv-d3d11-x86_64-v3/
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-d3d11-x86_64-v3
+          path: artifact/libmpv-d3d11-x86_64-v3
+      
+      - name: Save cache
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-v3-${{ steps.get_time.outputs.timestamp }}
+
+  # Optional: Also build regular x86_64 for comparison
+  mingw-standard:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache-standard
+      CCACHE_MAXSIZE: 500M
+      TARGET: x86_64-w64-mingw32
+      RUST_TARGET: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+      
+      - name: Download and apply PR#17764 patch
+        if: inputs.apply_pr == 'true'
+        run: |
+          curl -L "https://patch-diff.githubusercontent.com/raw/mpv-player/mpv/pull/17764.patch" -o /tmp/pr17764.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git am --3way /tmp/pr17764.patch || git apply --3way /tmp/pr17764.patch
+      
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ccache g++-mingw-w64 python3-pip nasm ninja-build pkgconf wine64
+          python -m pip install meson
+      
+      - name: Configure
+        run: |
+          mkdir -p build && cd build
+          meson setup .. \
+            --cross-file ../cross-files/${{ env.TARGET }}.txt \
+            --buildtype release \
+            -Dlibmpv=true \
+            -Dpdf-build=disabled \
+            -Dmanpage-build=disabled
+      
+      - name: Build
+        run: |
+          cd build
+          meson compile
+      
+      - name: Package
+        run: |
+          cd build
+          mkdir -p ../artifact/libmpv-d3d11-x86_64
+          cp -r mpv/include/mpv ../artifact/libmpv-d3d11-x86_64/ 2>/dev/null || true
+          find . -name "*.dll.a" -o -name "*.dll" | head -30 | while read f; do
+            cp "$f" ../artifact/libmpv-d3d11-x86_64/
+          done
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-d3d11-x86_64
+          path: artifact/libmpv-d3d11-x86_64
