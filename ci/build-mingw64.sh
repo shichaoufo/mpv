@@ -199,8 +199,13 @@ _amf_headers () {
 }
 _amf_headers_mark=include/AMF/core/Version.h
 
+# Pin FFmpeg for a reproducible build.
+FFMPEG_REF=611bcc793fd8fce743fc6b3f784c0b9b8cf0d961
 _ffmpeg () {
-    [ -d ffmpeg ] || $gitclone https://github.com/FFmpeg/FFmpeg.git ffmpeg
+    if [ ! -d ffmpeg ]; then
+        gettar "https://github.com/FFmpeg/FFmpeg/archive/${FFMPEG_REF}.tar.gz" "FFmpeg-${FFMPEG_REF}"
+        mv -v "FFmpeg-${FFMPEG_REF}" ffmpeg
+    fi
     builddir ffmpeg
     local args=(
         --pkg-config=pkg-config --target-os=mingw32 --enable-gpl
