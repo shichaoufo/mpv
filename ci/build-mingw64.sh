@@ -200,6 +200,9 @@ _amf_headers () {
 _amf_headers_mark=include/AMF/core/Version.h
 
 # Pin FFmpeg for a reproducible build.
+# 611bcc79 (2026-11-07) contains be65e08c18 "avformat/mov: ignore discarded
+# streams when placing the fragment position on seek" (2026-11-03), which fixes
+# fragmented MP4 seeks rescanning every fragment from the beginning of a file.
 FFMPEG_REF=611bcc793fd8fce743fc6b3f784c0b9b8cf0d961
 _ffmpeg () {
     if [ ! -d ffmpeg ]; then
