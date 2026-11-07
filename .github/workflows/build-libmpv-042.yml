@@ -1,0 +1,79 @@
+name: build-libmpv-042-selfbuilt
+
+on:
+  push:
+    branches:
+      - ci-v042
+  workflow_dispatch:
+
+jobs:
+  mingw-libmpv:
+    runs-on: ubuntu-24.04
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 500M
+      DOWNLOAD_CACHE: ${{ github.workspace }}/.ccache/downloads
+      TARGET: x86_64-w64-mingw32
+      RUST_TARGET: x86_64-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get time
+        id: get_time
+        run: echo "timestamp=`date +%s%N`" >> $GITHUB_OUTPUT
+
+      - name: Restore cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.TARGET }}-${{ steps.get_time.outputs.timestamp }}
+          restore-keys: ${{ env.TARGET }}-
+
+      - name: Install dependencies
+        run: |
+          rustup target add ${{ env.RUST_TARGET }}
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ccache g++-mingw-w64 gcc-multilib python3-pip nasm ninja-build pkgconf wine64
+          python -m pip install meson
+
+      - name: Install Meson Wraps
+        run: |
+          mkdir subprojects -p
+          meson wrap install mujs
+          meson subprojects download
+
+      - name: Build libraries
+        run: ./ci/build-mingw64.sh
+
+      - name: Build mpv with meson
+        id: build
+        run: ./ci/build-mingw64.sh meson pack
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: cat ./mingw_build/meson-logs/meson-log.txt
+
+      - name: Package libmpv dev bundle (BbQ layout)
+        run: |
+          set -e
+          out=artifact/mpv-dev
+          mkdir -p "$out/include/mpv" "$out/lib" "$out/runtime"
+          cp -v include/mpv/*.h "$out/include/mpv/"
+          cp -v mingw_build/libmpv-2.dll "$out/lib/mpv-2.dll"
+          cp -v mingw_build/libmpv.dll.a "$out/lib/libmpv-2.dll.a"
+          cp -v mingw_build/libmpv.dll.a "$out/lib/libmpv.dll.a"
+          for f in artifact/*.dll; do
+            [ -e "$f" ] && cp -v "$f" "$out/runtime/"
+          done
+          rm -f "$out/runtime/libmpv-2.dll"
+          find artifact -maxdepth 1 -type f -delete
+          echo "=== bundle ==="
+          find "$out" -type f | sort
+          echo "runtime DLL count: $(ls -1 "$out/runtime" | wc -l)"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-0.42.0-selfbuilt-ffmpeg611bcc79-${{ github.run_id }}
+          path: artifact/*
